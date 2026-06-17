@@ -10,7 +10,8 @@
     "postinstall": "prisma generate",
     "test:stress:build": "tsc -p tests/tsconfig.json && node -e \"require('fs').copyFileSync('tests/build/stress-test.js','tests/stress-test.js')\"",
     "test:stress": "npm run test:stress:build && k6 run tests/stress-test.js",
-    "shopify:token": "tsx scripts/get-shopify-token.ts"
+    "shopify:token": "tsx scripts/get-shopify-token.ts",
+    "test:inventory-change": "tsx scripts/publish-inventory-change.ts"
   },
   "engines": {
     "node": ">=20"

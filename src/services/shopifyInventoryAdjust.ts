@@ -11,6 +11,12 @@ export interface PushPendingDeltasResult {
   attempted: number;
   skipped: boolean;
   reason?: string;
+  failed: number;
+  failedReasons: Array<{
+    sourceIds: string[];
+    message: string;
+    code?: string;
+  }>;
 }
 
 interface AggregatedDelta {
@@ -18,6 +24,35 @@ interface AggregatedDelta {
   locationName: string;
   deltaQty: number;
   sourceIds: bigint[];
+}
+
+const SKU_CHUNK_SIZE = 50;
+const ITEM_CHUNK_SIZE = 100;
+const MUTATION_CHUNK_SIZE = 10;
+
+/**
+ * Splits an array into fixed-size chunks for batched GraphQL requests.
+ *
+ * @param items Source array to split.
+ * @param size Maximum chunk length.
+ * @returns Array of chunk arrays.
+ */
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size));
+  }
+  return out;
+}
+
+/**
+ * Escapes single quotes in a SKU for Shopify search query syntax.
+ *
+ * @param sku Raw SKU value.
+ * @returns Escaped SKU safe for `sku:'...'` search terms.
+ */
+function escapeSkuForSearch(sku: string): string {
+  return sku.replace(/'/g, "\\'");
 }
 
 /**
@@ -88,31 +123,49 @@ async function resolveLocationMap(
 /**
  * Resolves Shopify inventory item IDs for the given SKUs.
  *
+ * Uses a single `productVariants` query per chunk with OR-combined SKU search terms.
+ *
  * @param skus Distinct SKUs to resolve.
  * @returns Map of SKU to Shopify inventory item ID.
  */
 async function resolveVariantMap(
   skus: string[]
 ): Promise<Record<string, string>> {
+  const uniqueSkus = [...new Set(skus)];
+  if (uniqueSkus.length === 0) {
+    return {};
+  }
+
   const result: Record<string, string> = {};
 
-  for (const sku of skus) {
-    const data = await shopifyGraphQL<{
-      productVariants: {
-        nodes: { sku: string; inventoryItem: { id: string } }[];
-      };
-    }>(
-      `query($q: String!) {
-        productVariants(first: 1, query: $q) {
-          nodes { sku inventoryItem { id } }
-        }
-      }`,
-      { q: `sku:'${sku}'` }
-    );
+  const chunkResults = await Promise.all(
+    chunk(uniqueSkus, SKU_CHUNK_SIZE).map(async (chunkSkus) => {
+      const q = chunkSkus
+        .map((sku) => `sku:'${escapeSkuForSearch(sku)}'`)
+        .join(" OR ");
 
-    const node = data.productVariants.nodes[0];
-    if (node?.inventoryItem?.id) {
-      result[sku] = node.inventoryItem.id;
+      const data = await shopifyGraphQL<{
+        productVariants: {
+          nodes: { sku: string; inventoryItem: { id: string } | null }[];
+        };
+      }>(
+        `query($q: String!, $first: Int!) {
+          productVariants(first: $first, query: $q) {
+            nodes { sku inventoryItem { id } }
+          }
+        }`,
+        { q, first: chunkSkus.length }
+      );
+
+      return data.productVariants.nodes;
+    })
+  );
+
+  for (const nodes of chunkResults) {
+    for (const node of nodes) {
+      if (node.sku && node.inventoryItem?.id) {
+        result[node.sku] = node.inventoryItem.id;
+      }
     }
   }
 
@@ -122,50 +175,79 @@ async function resolveVariantMap(
 /**
  * Resolves current Shopify on_hand quantity per inventory item and location.
  *
+ * Uses `nodes(ids:)` to fetch inventory levels in bulk; assumes each item has at most
+ * 50 locations (MVP single-location shops). Add pagination if multi-location scale grows.
+ *
  * @param pairs Distinct inventory item and location ID pairs.
  * @returns Map keyed by `inventoryItemId::locationId` to on_hand quantity.
  */
 async function resolveOnHandMap(
   pairs: Array<{ inventoryItemId: string; locationId: string }>
 ): Promise<Record<string, number>> {
-  const result: Record<string, number> = {};
-  const uniqueKeys = new Set<string>();
+  const wantedKeys = new Set<string>();
+  const uniqueItemIds = new Set<string>();
 
   for (const pair of pairs) {
-    const key = `${pair.inventoryItemId}::${pair.locationId}`;
-    if (uniqueKeys.has(key)) {
-      continue;
-    }
-    uniqueKeys.add(key);
+    wantedKeys.add(`${pair.inventoryItemId}::${pair.locationId}`);
+    uniqueItemIds.add(pair.inventoryItemId);
+  }
 
-    const data = await shopifyGraphQL<{
-      inventoryItem: {
-        inventoryLevel: {
-          quantities: { name: string; quantity: number }[];
-        } | null;
-      } | null;
-    }>(
-      `query($inventoryItemId: ID!, $locationId: ID!) {
-        inventoryItem(id: $inventoryItemId) {
-          inventoryLevel(locationId: $locationId) {
-            quantities(names: ["on_hand"]) {
-              name
-              quantity
+  if (uniqueItemIds.size === 0) {
+    return {};
+  }
+
+  const result: Record<string, number> = {};
+
+  const chunkResults = await Promise.all(
+    chunk([...uniqueItemIds], ITEM_CHUNK_SIZE).map(async (chunkIds) => {
+      const data = await shopifyGraphQL<{
+        nodes: Array<{
+          id: string;
+          inventoryLevels: {
+            nodes: Array<{
+              location: { id: string };
+              quantities: { name: string; quantity: number }[];
+            }>;
+          };
+        } | null>;
+      }>(
+        `query($ids: [ID!]!) {
+          nodes(ids: $ids) {
+            ... on InventoryItem {
+              id
+              inventoryLevels(first: 50) {
+                nodes {
+                  location { id }
+                  quantities(names: ["on_hand"]) { name quantity }
+                }
+              }
             }
           }
-        }
-      }`,
-      {
-        inventoryItemId: pair.inventoryItemId,
-        locationId: pair.locationId,
-      }
-    );
+        }`,
+        { ids: chunkIds }
+      );
 
-    const onHand =
-      data.inventoryItem?.inventoryLevel?.quantities.find(
-        (q) => q.name === "on_hand"
-      )?.quantity ?? 0;
-    result[key] = onHand;
+      return data.nodes;
+    })
+  );
+
+  for (const nodes of chunkResults) {
+    for (const node of nodes) {
+      if (!node) {
+        continue;
+      }
+
+      for (const level of node.inventoryLevels.nodes) {
+        const key = `${node.id}::${level.location.id}`;
+        if (!wantedKeys.has(key)) {
+          continue;
+        }
+
+        const onHand =
+          level.quantities.find((q) => q.name === "on_hand")?.quantity ?? 0;
+        result[key] = onHand;
+      }
+    }
   }
 
   return result;
@@ -174,9 +256,12 @@ async function resolveOnHandMap(
 /**
  * Pushes pending WMS inventory deltas to Shopify via inventorySetQuantities (2026-04 on_hand).
  *
+ * Processes mutations in chunks of {@link MUTATION_CHUNK_SIZE} sequentially. Failed chunks
+ * are isolated — successful chunks are partially marked `isShopifyPushed = true`.
+ *
  * @param options Optional SKU filter for critical single-shot sync.
- * @returns Count of pushed adjustments and source rows attempted.
- * @throws When Shopify returns userErrors or required credentials are missing.
+ * @returns Count of pushed/failed adjustments and per-chunk failure details.
+ * @throws When bulk resolve steps fail or required credentials are missing.
  */
 export async function pushPendingDeltas(
   options: PushPendingDeltasOptions = {}
@@ -189,8 +274,15 @@ export async function pushPendingDeltas(
       attempted: 0,
       skipped: true,
       reason: "no-pending-deltas",
+      failed: 0,
+      failedReasons: [],
     };
   }
+
+  const attempted = aggregated.reduce(
+    (count, group) => count + group.sourceIds.length,
+    0
+  );
 
   const locationMap = await resolveLocationMap([
     ...new Set(aggregated.map((group) => group.locationName)),
@@ -211,12 +303,11 @@ export async function pushPendingDeltas(
   if (changes.length === 0) {
     return {
       pushed: 0,
-      attempted: aggregated.reduce(
-        (count, group) => count + group.sourceIds.length,
-        0
-      ),
+      attempted,
       skipped: true,
       reason: "no-resolvable-deltas",
+      failed: 0,
+      failedReasons: [],
     };
   }
 
@@ -228,7 +319,7 @@ export async function pushPendingDeltas(
   );
 
   const mutationChanges = changes.map(
-    ({ delta, inventoryItemId, locationId }) => {
+    ({ delta, inventoryItemId, locationId, sourceIds }) => {
       const key = `${inventoryItemId}::${locationId}`;
       const changeFromQuantity = onHandMap[key] ?? 0;
       return {
@@ -237,60 +328,85 @@ export async function pushPendingDeltas(
         quantity: changeFromQuantity + delta,
         changeFromQuantity,
         delta,
+        sourceIds,
       };
     }
   );
 
-  const sourceIds = changes.flatMap((change) => change.sourceIds);
-  const idempotencyKey = createHash("sha256")
-    .update(sourceIds.map(String).sort().join(","))
-    .digest("hex");
+  const chunks = chunk(mutationChanges, MUTATION_CHUNK_SIZE);
+  let pushed = 0;
+  let failed = 0;
+  const failedReasons: PushPendingDeltasResult["failedReasons"] = [];
 
-  const data = await shopifyGraphQL<{
-    inventorySetQuantities: {
-      userErrors: { field: string[]; message: string; code?: string }[];
-    };
-  }>(
-    `mutation($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
-      inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
-        inventoryAdjustmentGroup { createdAt reason }
-        userErrors { field message code }
+  for (const chunkChanges of chunks) {
+    const chunkSourceIds = chunkChanges.flatMap((change) => change.sourceIds);
+    const idempotencyKey = createHash("sha256")
+      .update(chunkSourceIds.map(String).sort().join(","))
+      .digest("hex");
+
+    try {
+      const data = await shopifyGraphQL<{
+        inventorySetQuantities: {
+          userErrors: { field: string[]; message: string; code?: string }[];
+        };
+      }>(
+        `mutation($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
+          inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) {
+            inventoryAdjustmentGroup { createdAt reason }
+            userErrors { field message code }
+          }
+        }`,
+        {
+          input: {
+            name: "on_hand",
+            reason: "correction",
+            quantities: chunkChanges.map(
+              ({
+                quantity,
+                inventoryItemId,
+                locationId,
+                changeFromQuantity,
+              }) => ({
+                quantity,
+                inventoryItemId,
+                locationId,
+                changeFromQuantity,
+              })
+            ),
+          },
+          idempotencyKey,
+        }
+      );
+
+      if (data.inventorySetQuantities.userErrors.length > 0) {
+        failed += chunkSourceIds.length;
+        failedReasons.push({
+          sourceIds: chunkSourceIds.map(String),
+          message: JSON.stringify(data.inventorySetQuantities.userErrors),
+          code: data.inventorySetQuantities.userErrors[0]?.code,
+        });
+        continue;
       }
-    }`,
-    {
-      input: {
-        name: "on_hand",
-        reason: "correction",
-        quantities: mutationChanges.map(
-          ({ quantity, inventoryItemId, locationId, changeFromQuantity }) => ({
-            quantity,
-            inventoryItemId,
-            locationId,
-            changeFromQuantity,
-          })
-        ),
-      },
-      idempotencyKey,
-    }
-  );
 
-  if (data.inventorySetQuantities.userErrors.length > 0) {
-    throw new Error(
-      `Shopify userErrors: ${JSON.stringify(data.inventorySetQuantities.userErrors)}`
-    );
+      await prisma.wmsInventoryChange.updateMany({
+        where: { id: { in: chunkSourceIds } },
+        data: { isShopifyPushed: true },
+      });
+      pushed += chunkChanges.length;
+    } catch (error) {
+      failed += chunkSourceIds.length;
+      failedReasons.push({
+        sourceIds: chunkSourceIds.map(String),
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
-  await prisma.wmsInventoryChange.updateMany({
-    where: { id: { in: sourceIds } },
-    data: { isShopifyPushed: true },
-  });
-
   return {
-    pushed: changes.length,
-    attempted: aggregated.reduce(
-      (count, group) => count + group.sourceIds.length,
-      0
-    ),
+    pushed,
+    attempted,
     skipped: false,
+    failed,
+    failedReasons,
   };
 }

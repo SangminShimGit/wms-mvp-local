@@ -30,7 +30,7 @@ flowchart LR
         InvQueue --> InvWorker[Inventory BullMQ Worker]
         InvWorker -->|"create delta + increment stock"| PG
         InvWorker -->|"stock <= threshold"| InngestSrv
-        InngestSrv -->|"cron */15m | event inventory/sync.requested"| Track1["inventorySync Track1"]
+        InngestSrv -->|"cron */15m | event inventory/delta-push.requested"| Track1["inventorySync Track1"]
         InngestSrv -->|"event inventory/critical.detected"| Track2["inventoryCriticalSync Track2"]
         BullBoard[Bull-board /admin/queues] -.observes.-> BullMQ
         BullBoard -.observes.-> InvQueue
@@ -52,7 +52,7 @@ flowchart LR
 3. BullMQ Worker → Prisma `wmsOrder.create()` → Supabase DB에 `PENDING` INSERT
 4. Inngest `orderWorkflow` → 10초 대기 → 검증 → `finalize-wms-allocation` → `READY_TO_SHIP` UPDATE
 
-### Inventory sync lifecycle (Two-Track)
+### Inventory delta push lifecycle (Two-Track)
 
 WMS 내부는 **변동량(Delta) 큐**로 관리하고, Shopify push는 **`2026-04` `inventorySetQuantities`**로 `on_hand`를 갱신합니다. 대량 마스터 변경은 **10개/청크 순차 push + partial success**로 fault를 격리합니다. 위험도에 따라 두 트랙으로 분리됩니다.
 
@@ -66,14 +66,14 @@ WMS 내부는 **변동량(Delta) 큐**로 관리하고, Shopify push는 **`2026-
    - `WmsInventory.stock`을 `increment: delta`로 갱신 (스냅샷)
 4. 갱신 후 `stock <= CRITICAL_STOCK_THRESHOLD`(기본 `0`)이면 Inngest `inventory/critical.detected` 이벤트 즉시 발행
 
-#### Track 1: Bulk Batch Sync (일반 변동)
+#### Track 1: Bulk batch delta push (일반 변동)
 
-- **트리거**: Inngest cron `*/15 * * * *` 또는 수동 이벤트 `inventory/sync.requested`
+- **트리거**: Inngest cron `*/15 * * * *` 또는 수동 이벤트 `inventory/delta-push.requested`
 - **함수**: `inventorySync` → `pushPendingDeltas()` (전체 미처리 delta)
 - **Shopify API**: `inventorySetQuantities` (`name: "on_hand"`, `@idempotent`, `changeFromQuantity`, **10개/청크 순차**)
 - **완료**: 성공 청크 source 행만 `isShopifyPushed = true` (partial success)
 
-#### Track 2: Instant Single-Shot Sync (품절 임박 방어)
+#### Track 2: Instant single-SKU delta push (품절 임박 방어)
 
 - **트리거**: `inventory/critical.detected` (BullMQ worker가 임계값 진입 시 자동 발행)
 - **함수**: `inventoryCriticalSync` → `pushPendingDeltas({ sku })` (해당 SKU 미처리 delta만 즉시 drain)
@@ -124,7 +124,7 @@ WMS 내부는 **변동량(Delta) 큐**로 관리하고, Shopify push는 **`2026-
 >
 > **동시성**: `changeFromQuantity` stale 시 해당 **청크만** `failedReasons`에 기록되고 나머지 청크는 push 계속됩니다.
 >
-> **`WmsInventory.isSynced`**: 레거시 컬럼으로 유지되나, 현재 sync 파이프라인은 `wms_inventory_changes` 큐를 사용합니다.
+> **`WmsInventory.isSynced`**: 레거시 컬럼으로 유지되나, 현재 delta push 파이프라인은 `wms_inventory_changes` 큐를 사용합니다.
 
 ### DB connectivity
 
@@ -278,10 +278,10 @@ ORDER BY id DESC;
 | `INNGEST_SERVE_HOST` | `http://app:3000` | Inngest가 콜백할 앱 URL (Docker 내부) |
 | `INNGEST_EVENT_KEY` | `local-dev-event-key` | 이벤트 전송 키 |
 | `INNGEST_SIGNING_KEY` | `local-dev-signing-key` | 서명 검증 키 |
-| `SHOPIFY_SHOP_DOMAIN` | `${SHOPIFY_SHOP_DOMAIN:-}` | Shopify 스토어 도메인 (`*.myshopify.com`) — `inventorySync`용 |
+| `SHOPIFY_SHOP_DOMAIN` | `${SHOPIFY_SHOP_DOMAIN:-}` | Shopify 스토어 도메인 (`*.myshopify.com`) — delta push용 |
 | `SHOPIFY_ADMIN_ACCESS_TOKEN` | `${SHOPIFY_ADMIN_ACCESS_TOKEN:-}` | Admin API access token (custom app 발급) |
 | `SHOPIFY_API_VERSION` | `${SHOPIFY_API_VERSION:-2026-04}` | Admin GraphQL API 버전 (`.env`로 `2026-04` 등 override) |
-| `CRITICAL_STOCK_THRESHOLD` | `${CRITICAL_STOCK_THRESHOLD:-0}` | Track 2 즉시 sync 트리거 임계값 (`stock <= threshold`) |
+| `CRITICAL_STOCK_THRESHOLD` | `${CRITICAL_STOCK_THRESHOLD:-0}` | Track 2 즉시 delta push 트리거 임계값 (`stock <= threshold`) |
 
 > Shopify 변수는 **호스트 `.env`**에서 읽혀 `docker-compose up` 시 `app` 컨테이너로 전달됩니다. `.env` 변경 후 `docker-compose up -d --force-recreate app`으로 재기동하세요.
 
@@ -421,18 +421,18 @@ command: ["inngest", "dev", "-u", "http://app:3000/api/inngest"]
 | `validate` | order ID 존재 확인 |
 | `finalize-wms-allocation` | `prisma.wmsOrder.update` → `READY_TO_SHIP` |
 
-**`inventorySync` (Track 1)** — [`src/workers/inngest/inventorySync.ts`](src/workers/inngest/inventorySync.ts)
+**`inventorySync` (Track 1 — Bulk pending delta push to Shopify)** — [`src/workers/inngest/inventorySync.ts`](src/workers/inngest/inventorySync.ts)
 
 | Trigger | Value |
 |---------|-------|
 | Cron | `*/15 * * * *` (15분마다) |
-| Event | `inventory/sync.requested` (수동/외부 호출) |
+| Event | `inventory/delta-push.requested` (수동/외부 호출) |
 
 | Step | Action |
 |------|--------|
 | `push-pending-deltas` | `pushPendingDeltas()` — 전체 미처리 delta를 Shopify에 일괄 push |
 
-**`inventoryCriticalSync` (Track 2)** — [`src/workers/inngest/inventoryCriticalSync.ts`](src/workers/inngest/inventoryCriticalSync.ts)
+**`inventoryCriticalSync` (Track 2 — Instant pending delta push (critical))** — [`src/workers/inngest/inventoryCriticalSync.ts`](src/workers/inngest/inventoryCriticalSync.ts)
 
 | Trigger | Value |
 |---------|-------|
@@ -576,9 +576,9 @@ mutation($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
 ```bash
 # 0. (최초 1회) 환경변수 설정
 cp .env.example .env
-# .env 편집: DATABASE_URL, SHOPIFY_* (inventory sync 사용 시)
+# .env 편집: DATABASE_URL, SHOPIFY_* (inventory delta push 사용 시)
 
-# 0b. (inventory sync) Admin API 토큰 발급 — Partner app OAuth
+# 0b. (inventory delta push) Admin API 토큰 발급 — Partner app OAuth
 npm run shopify:token
 # 출력된 SHOPIFY_ADMIN_ACCESS_TOKEN= 를 .env에 붙여넣기
 
@@ -675,7 +675,7 @@ Inngest SDK serve endpoint. Inngest Dev Server가 함수를 sync/invoke합니다
 | Function | Trigger | Role |
 |----------|---------|------|
 | `orderWorkflow` | `order/received` | 주문 검증 → `READY_TO_SHIP` UPDATE |
-| `inventorySync` | cron `*/15 * * * *`, `inventory/sync.requested` | Track 1: 미처리 delta bulk push |
+| `inventorySync` | cron `*/15 * * * *`, `inventory/delta-push.requested` | Track 1: 미처리 delta bulk push |
 | `inventoryCriticalSync` | `inventory/critical.detected` | Track 2: critical SKU delta 즉시 push |
 
 ---
@@ -792,21 +792,21 @@ supabase db execute --sql 'SELECT id, "shopifyId", status FROM "WmsOrder";'
 | `INNGEST_EVENT_KEY` | `local-dev-event-key` | same | Inngest SDK |
 | `INNGEST_SIGNING_KEY` | `local-dev-signing-key` | same | Inngest SDK |
 | `KAFKA_CLIENT_ID` | `wms-mvp-local` | same | kafkajs (optional override) |
-| `SHOPIFY_SHOP_DOMAIN` | from `.env` | from `.env` | inventory sync, OAuth token script |
+| `SHOPIFY_SHOP_DOMAIN` | from `.env` | from `.env` | inventory delta push, OAuth token script |
 | `SHOPIFY_CLIENT_ID` | — (호스트 전용) | from `.env` | `npm run shopify:token` (Partner app OAuth) |
 | `SHOPIFY_CLIENT_SECRET` | — (호스트 전용) | from `.env` | `npm run shopify:token` |
 | `SHOPIFY_OAUTH_PORT` | — (호스트 전용, default `53682`) | from `.env` | OAuth callback `http://localhost:{PORT}/callback` |
 | `SHOPIFY_SCOPES` | — (optional) | `read_locations,read_products,write_inventory` | OAuth token script (override 가능) |
-| `SHOPIFY_ADMIN_ACCESS_TOKEN` | from `.env` | from `.env` | inventory sync (Admin API 인증) |
-| `SHOPIFY_API_VERSION` | `2026-04` (compose default) | `2026-04` (`.env.example`) | inventory sync GraphQL API 버전 |
-| `CRITICAL_STOCK_THRESHOLD` | `0` (default) | `0` | Track 2 즉시 sync 트리거 (`stock <= threshold`) |
+| `SHOPIFY_ADMIN_ACCESS_TOKEN` | from `.env` | from `.env` | inventory delta push (Admin API 인증) |
+| `SHOPIFY_API_VERSION` | `2026-04` (compose default) | `2026-04` (`.env.example`) | inventory delta push GraphQL API 버전 |
+| `CRITICAL_STOCK_THRESHOLD` | `0` (default) | `0` | Track 2 즉시 delta push 트리거 (`stock <= threshold`) |
 | `TEST_SKU` | — | `sku-managed-1` (optional) | `npm run test:inventory-change` 기본 SKU override |
 | `TEST_LOCATION` | — | `Shop location` (optional) | `npm run test:inventory-change` 기본 location override |
 | `TEST_DELTA` | — | `-5` (optional) | `npm run test:inventory-change` 기본 delta override |
 
 ## Shopify Admin API Token 발급
 
-`inventorySync` / `inventoryCriticalSync`는 `SHOPIFY_ADMIN_ACCESS_TOKEN`이 필요합니다. Partner Dashboard에 등록한 앱(Client ID/Secret) 기준으로 호스트에서 OAuth code grant를 실행합니다.
+`inventorySync` / `inventoryCriticalSync`는 delta push용 `SHOPIFY_ADMIN_ACCESS_TOKEN`이 필요합니다. Partner Dashboard에 등록한 앱(Client ID/Secret) 기준으로 호스트에서 OAuth code grant를 실행합니다.
 
 ### 사전 준비
 
@@ -883,7 +883,7 @@ wms-mvp-local/
         │   └── inventoryChangeWorker.ts  # delta intake + critical event
         └── inngest/
             ├── client.ts         # Inngest client + orderWorkflow
-            ├── inventorySync.ts  # Track 1: cron */15m + inventory/sync.requested
+            ├── inventorySync.ts  # Track 1: cron */15m + inventory/delta-push.requested
             └── inventoryCriticalSync.ts  # Track 2: inventory/critical.detected
 ```
 
@@ -925,7 +925,7 @@ npm run dev
 6. Supabase Studio → `WmsOrder` row: `PENDING` → `READY_TO_SHIP` after ~10s
 7. Inngest UI → `orderWorkflow` shows `finalize-wms-allocation` succeeded
 
-### Inventory sync (Two-Track, Shopify push)
+### Inventory delta push (Two-Track, Shopify)
 
 > **사전 조건**
 > 1. `.env`에 `SHOPIFY_SHOP_DOMAIN`, `SHOPIFY_ADMIN_ACCESS_TOKEN` 설정 ([Shopify Admin API Token 발급](#shopify-admin-api-token-발급) 참고)
@@ -1005,14 +1005,14 @@ $msg | docker exec -i wms-mvp-local-kafka-1 kafka-console-producer `
 
 **Track 1 push 트리거** (수동, 권장):
 
-Inngest UI (http://localhost:8288) → **Functions** → `Bulk inventory sync to Shopify` → **Invoke**
-- Event: `inventory/sync.requested`, Data: `{}`
+Inngest UI (http://localhost:8288) → **Functions** → `Bulk pending delta push to Shopify` → **Invoke**
+- Event: `inventory/delta-push.requested`, Data: `{}`
 
 ```powershell
 Invoke-RestMethod `
   -Uri http://localhost:8288/e/local-dev-event-key `
   -Method POST `
-  -Body '{"name":"inventory/sync.requested","data":{}}' `
+  -Body '{"name":"inventory/delta-push.requested","data":{}}' `
   -ContentType "application/json"
 ```
 
@@ -1029,7 +1029,7 @@ Shopify Admin → variant **Inventory** → 해당 Location **On hand**가 `chan
 
 **Cron 대기**: 최대 15분 (`*/15 * * * *`)
 
-#### 3. Track 2 테스트 — critical stock (즉시 sync)
+#### 3. Track 2 테스트 — critical stock (즉시 delta push)
 
 스냅샷을 품절 임박 수준으로 맞춘 뒤, 품절을 유발하는 delta 발행:
 
@@ -1056,7 +1056,7 @@ $msg | docker exec -i wms-mvp-local-kafka-1 kafka-console-producer `
 | Check | Where | Expected |
 |-------|-------|----------|
 | BullMQ log | `docker-compose logs app` | `critical=true` |
-| Inngest Run | http://localhost:8288 → `Instant inventory sync (critical)` | `push-critical` step 성공 |
+| Inngest Run | http://localhost:8288 → `Instant pending delta push (critical)` | `push-critical` step 성공 |
 | Delta pushed | Studio → `wms_inventory_changes` | `isShopifyPushed = true` |
 | Shopify | Admin Inventory | On hand가 delta만큼 반영 |
 
@@ -1081,7 +1081,7 @@ ORDER BY id DESC;
 
 #### 5. Idempotency (skip 확인)
 
-모든 delta가 `isShopifyPushed = true`인 상태에서 `inventory/sync.requested` 재발행:
+모든 delta가 `isShopifyPushed = true`인 상태에서 `inventory/delta-push.requested` 재발행:
 
 ```json
 { "skipped": true, "reason": "no-pending-deltas", "pushed": 0, "attempted": 0 }
@@ -1108,7 +1108,7 @@ docker-compose up -d --force-recreate app
 | `changeFromQuantity` required / `@idempotent` required | 2026-04 필수 필드 누락 | 최신 `shopifyInventoryAdjust.ts` 사용 여부 확인 |
 | `INVALID_QUANTITY_NAME` (`on_hand` on adjust) | `inventoryAdjustQuantities`로 on_hand 시도 | `inventorySetQuantities` 사용 (현재 코드 기본) |
 | `CHANGE_FROM_QUANTITY_STALE` | push 직전 Shopify 재고 변동 (주문 끼어들기 등) | 해당 청크만 `failedReasons` 기록, 나머지 청크는 push 완료. 실패 row는 다음 cron에서 재시도 |
-| `{ failed: N, failedReasons: [...] }` in Inngest result | 일부 청크 push 실패 (의도된 partial failure) | Inngest UI에서 `failedReasons` 확인. Studio에서 실패 row `isShopifyPushed=false` 확인 후 다음 sync 대기 |
+| `{ failed: N, failedReasons: [...] }` in Inngest result | 일부 청크 push 실패 (의도된 partial failure) | Inngest UI에서 `failedReasons` 확인. Studio에서 실패 row `isShopifyPushed=false` 확인 후 다음 delta push 대기 |
 | BullMQ inventory job failed | `WmsInventory`에 SKU 없음 | Studio에서 스냅샷 행 먼저 INSERT |
 | Track 2 미발동 | threshold 미달 | `CRITICAL_STOCK_THRESHOLD` 및 현재 `stock` 확인 |
 | Kafka 메시지 무응답 | topic/consumer 미기동 | `docker-compose logs app`에서 `inventory change consumer started` 확인 |
@@ -1141,9 +1141,9 @@ npm run test:stress
 | `WmsOrder` table missing in Studio | Schema not pushed yet | Restart `app` container (runs `prisma db push` on start) |
 | OAuth `redirect_uri is missing` | Windows `cmd start`가 URL을 `&`에서 잘림 | 터미널 URL **전체** 복사·붙여넣기 (스크립트는 `rundll32` 사용으로 수정됨) |
 | OAuth `listen EACCES :53682` | Windows 예약 포트 | `.env`에 `SHOPIFY_OAUTH_PORT=3456`, Partner app redirect URL도 동일 포트로 등록 |
-| Inventory sync env 변경 미반영 | Docker는 기동 시 env 고정 | `docker-compose up -d --force-recreate app` |
-| Inventory sync 코드 변경 미반영 | Docker image에 stale `dist/` | `docker compose build --no-cache app && docker compose up -d app` |
-| `Shopify 429` during inventory sync | 대량 mutation 단일 호출 (구 코드) | chunked push (`MUTATION_CHUNK_SIZE=10`) 반영 후 image 재빌드 |
+| Inventory delta push env 변경 미반영 | Docker는 기동 시 env 고정 | `docker-compose up -d --force-recreate app` |
+| Inventory delta push 코드 변경 미반영 | Docker image에 stale `dist/` | `docker compose build --no-cache app && docker compose up -d app` |
+| `Shopify 429` during inventory delta push | 대량 mutation 단일 호출 (구 코드) | chunked push (`MUTATION_CHUNK_SIZE=10`) 반영 후 image 재빌드 |
 | Inngest shows `failed > 0` but step succeeded | partial failure by design | `failedReasons` 확인; `isShopifyPushed=false` row는 다음 cron 재시도 |
 | `wms_inventory_changes` table missing | Schema not pushed | Restart `app` container (`prisma db push` on start) |
 | Inventory Kafka message ignored | Consumer not started | `docker-compose logs app` → `inventory change consumer started` |
